@@ -1,0 +1,378 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+  SSMParameterName:
+    Type: String
+    Description: SSM Parameter Name
+    Default: "JIRA_API_KEY"
+
+  JiraURL:
+    Type: String
+    Description: "The URL of the Jira instance"
+    Default: "https://lvthillo.atlassian.net"
+
+  ProjectKey:
+    Type: String
+    Description: "The key for the Jira project"
+    Default: "KAN"
+
+  IssueTypeName:
+    Type: String
+    Description: "The type of the Jira issue"
+    Default: "Task"
+
+  JiraUsername:
+    Type: String
+    Description: "The username for Jira authentication"
+    Default: "lorenz.vanthillo@gmail.com"
+
+Resources:
+  ### EventBridge Rule for Schema created/updated events
+  EventBridgeRuleUpdated:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - "aws.schemas"
+        detail-type:
+          - "Schema Version Created"
+      Targets:
+        - Arn: !GetAtt  SQSQueue.Arn
+          Id: "Target-updated"
+
+  # Creating a new Schema will also trigger generating a new Schema Version
+  # EventBridgeRuleCreated:
+  #   Type: AWS::Events::Rule
+  #   Properties:
+  #     EventPattern:
+  #       source:
+  #         - "aws.schemas"
+  #       detail-type:
+  #         - "Schema Created"
+  #     Targets:
+  #       - Arn: !GetAtt SQSQueue.Arn
+  #         Id: "Target-created"
+
+  SQSQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      MessageRetentionPeriod: 1209600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt SQSDLQueue.Arn
+        maxReceiveCount: 5
+
+  SQSQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: SQS:SendMessage
+            Resource: !GetAtt SQSQueue.Arn
+      Queues:
+        - !Ref SQSQueue
+
+  SQSDLQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      MessageRetentionPeriod: 1209600
+
+  EventBridgePipe:
+    Type: AWS::Pipes::Pipe
+    Properties:
+      Name: 'EventBridgePipe'
+      RoleArn: !GetAtt EventBridgePipesRole.Arn
+      Source: !GetAtt SQSQueue.Arn
+      SourceParameters:
+        SqsQueueParameters:
+          BatchSize: 1
+        FilterCriteria:
+          Filters:
+            - Pattern: '{"body": {"source": ["aws.schemas"]}}' # Optional
+      Enrichment: !GetAtt EnrichmentLambda.Arn
+      EnrichmentParameters:
+        InputTemplate: '{"input": <$.body>}'
+      Target: !Ref StateMachine
+      TargetParameters:
+        StepFunctionStateMachineParameters:
+          InvocationType: FIRE_AND_FORGET
+
+  EnrichmentLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "EnrichmentLambdaFunction"
+      Handler: "index.lambda_handler"
+      Runtime: "python3.12"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 10
+      Code:
+        ZipFile: |
+          """ Enrich Schema Event """
+          import json
+          import boto3
+          from botocore.exceptions import ClientError
+
+          client = boto3.client("schemas")
+
+
+          def lambda_handler(event, _):
+              """ Handler """
+              print("Received event:", json.dumps(event))
+
+              data = event[0]["input"]["detail"]
+
+              try:
+                  response = client.describe_schema(
+                      RegistryName=data["RegistryName"],
+                      SchemaName=data["SchemaName"],
+                      SchemaVersion=data["Version"],
+                  )
+              except ClientError as e:
+                  raise e
+
+              return_data = {
+                  "SchemaName": response["SchemaName"],
+                  "SchemaVersion": response["SchemaVersion"],
+                  "SchemaArn": response["SchemaArn"],
+                  "Content": json.loads(response["Content"]),
+              }
+
+              print(return_data)
+
+              return {"statusCode": 200, "data": return_data}
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: /aws/lambda/EnrichmentLambdaFunction
+      RetentionInDays: 14
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "schemas:DescribeSchema"
+                Resource: "*"
+
+  SnsTopic:
+    Type: AWS::SNS::Topic
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DisplayName: "Alerts"
+
+  EventBridgePipesRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - pipes.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+        - PolicyName: ReadSQS
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sqs:ReceiveMessage'
+                  - 'sqs:DeleteMessage'
+                  - 'sqs:GetQueueAttributes'
+                Resource: !GetAtt SQSQueue.Arn
+        - PolicyName: ExecuteStepFunction
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'states:StartExecution'
+                Resource: !Ref StateMachine
+        - PolicyName: ExecuteEnrichmentFunction
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: !GetAtt EnrichmentLambda.Arn
+
+  ### State Machine setup
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt StateMachineRole.Arn
+      # https://gist.github.com/mnanchev/6258825665da23e4e9ad7fe51c11d9c6
+      DefinitionString:
+       !Sub |
+        {
+          "Comment": "A description of my state machine",
+          "StartAt": "RaiseJiraTicket",
+          "States": {
+            "RaiseJiraTicket": {
+              "Type": "Task",
+              "Parameters": {
+                "DocumentName": "AWS-CreateJiraIssue",
+                "Parameters": {
+                  "IssueSummary.$": "States.Array(States.Format('New SchemaVersion {} SchemaName {}', $[0].data.SchemaVersion, $[0].data.SchemaName))",
+                  "JiraURL": [
+                    "${JiraURL}"
+                  ],
+                  "ProjectKey": [
+                    "${ProjectKey}"
+                  ],
+                  "IssueDescription.$": "States.Array(States.Format('Arn is {}', $[0].data.SchemaArn))",
+                  "IssueTypeName": [
+                    "${IssueTypeName}"
+                  ],
+                  "JiraUsername": [
+                    "${JiraUsername}"
+                  ],
+                  "SSMParameterName": [
+                    "${SSMParameterName}"
+                  ]
+                }
+              },
+              "Resource": "arn:aws:states:::aws-sdk:ssm:startAutomationExecution",
+              "Next": "WaitAutomationExecution"
+            },
+            "WaitAutomationExecution": {
+              "Type": "Wait",
+              "Seconds": 360,
+              "Next": "GetAutomationExecutionStatus"
+            },
+            "GetAutomationExecutionStatus": {
+              "Type": "Task",
+              "Parameters": {
+                "AutomationExecutionId.$": "$.AutomationExecutionId"
+              },
+              "Resource": "arn:aws:states:::aws-sdk:ssm:getAutomationExecution",
+              "Next": "CheckIfSuccessful"
+            },
+            "CheckIfSuccessful": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.AutomationExecution.AutomationExecutionStatus",
+                  "StringEquals": "Failed",
+                  "Next": "NotifyOnFailure"
+                }
+              ],
+              "Default": "PassOnSuccess"
+            },
+            "NotifyOnFailure": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "Message.$": "$",
+                "TopicArn": "${SnsTopic}"
+              },
+              "End": true
+            },
+            "PassOnSuccess": {
+              "Type": "Pass",
+              "End": true
+            }
+          }
+        }
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StateMachinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:StartAutomationExecution
+                  - ssm:GetAutomationExecution
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${SSMParameterName}
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SnsTopic
+              - Effect: Allow
+                Action:
+                  - cloudformation:Create*
+                  - cloudformation:Delete*
+                  - cloudformation:Describe*
+                Resource: 
+                  - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/CreateJiraIssueMacroStack* 
+                  - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/CreateJiraIssueLambdaStack*
+                  - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:transform/ParameterParserMacro
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:DeleteRolePolicy
+                  - iam:GetRole
+                  - iam:PassRole
+                  - iam:PutRolePolicy
+                Resource: 
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/CreateJiraIssueMacroStack*
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/CreateJiraIssueLambdaStack*
+              - Effect: Allow
+                Action:
+                  - lambda:GetFunction
+                  - lambda:CreateFunction
+                  - lambda:DeleteFunction
+                  - lambda:InvokeFunction
+                Resource: 
+                  - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:ParameterParserFunction*
+                  - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:CreateJiraIssueLambda*
+            
